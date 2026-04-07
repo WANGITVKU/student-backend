@@ -1,0 +1,108 @@
+# application.yml - Configuration for Dual Database Setup
+
+spring:
+  datasource:
+    primary:
+      url: jdbc:postgresql://your-render-host:5432/your_db
+      username: postgres
+      password: your_render_password
+      hikari:
+        maximum-pool-size: 10
+        minimum-idle: 5
+        connection-timeout: 10000          # 10 seconds (thay vì 30s default)
+        idle-timeout: 600000                # 10 minutes
+        max-lifetime: 1800000               # 30 minutes
+    secondary:
+      url: jdbc:postgresql://your-railway-host:5432/your_db
+      username: postgres
+      password: your_railway_password
+      hikari:
+        maximum-pool-size: 5
+        minimum-idle: 2
+        connection-timeout: 10000
+        idle-timeout: 600000
+        max-lifetime: 1800000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate              # ✅ Không auto-create (được quản lý manual)
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  # ✅ Enable async processing
+  task:
+    execution:
+      pool:
+        core-size: 2
+        max-size: 5
+        queue-capacity: 100
+        thread-name-prefix: student-service-
+
+  # ✅ Enable scheduled tasks
+  task1:
+    scheduling:
+      pool:
+        size: 1
+        thread-name-prefix: scheduler-
+
+logging:
+  level:
+    root: INFO
+    com.example.demo.studentbackend: DEBUG
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+app:
+  secondary:
+    enabled: true              # ✅ Feature flag để disable secondary DB nếu cần
+
+
+---
+
+# application-dev.yml - Development config
+spring:
+  config:
+    activate:
+      on-profile: dev
+  datasource:
+    primary:
+      url: jdbc:postgresql://localhost:5432/student_primary
+      username: postgres
+      password: postgres
+    secondary:
+      url: jdbc:postgresql://localhost:5433/student_secondary
+      username: postgres
+      password: postgres
+
+logging:
+  level:
+    com.example.demo.studentbackend: DEBUG
+    org.springframework.jdbc.core: DEBUG
+
+
+---
+
+# application-prod.yml - Production config
+spring:
+  config:
+    activate:
+      on-profile: prod
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  datasource:
+    primary:
+      hikari:
+        maximum-pool-size: 20
+        minimum-idle: 10
+    secondary:
+      hikari:
+        maximum-pool-size: 10
+        minimum-idle: 5
+
+logging:
+  level:
+    root: WARN
+    com.example.demo.studentbackend: INFO

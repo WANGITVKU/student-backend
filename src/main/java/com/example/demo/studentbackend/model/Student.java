@@ -1,4 +1,5 @@
-package com.example.demo.studentbackend;
+package com.example.demo.studentbackend.model;
+
 import jakarta.persistence.*;
 import lombok.*;
 
