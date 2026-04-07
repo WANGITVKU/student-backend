@@ -20,132 +20,44 @@ import javax.sql.DataSource;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * 🧠 SERVICE: StudentService
- * 
- * Mục đích:
- *  - Chứa logic nghiệp vụ (business logic) chính
- *  - Xử lý CRUD operations cho sinh viên
- *  - Quản lý dual-database (Render primary + Railway secondary)
- *  - Tự động sync dữ liệu giữa 2 database
- * 
- * Kiến trúc Dual-Database:
- *  ┌─────────────────────┐
- *  │   Controller        │ (API Endpoints)
- *  └──────────┬──────────┘
- *             │
- *  ┌──────────▼──────────┐
- *  │  StudentService     │ (Logic + Failover)
- *  └──┬────────────────┬─┘
- *     │                │
- *  ┌──▼────┐      ┌───▼──┐
- *  │Render │      │Railway│ (Primary) (Secondary)
- *  │(Render)      │(Rail) │
- *  └─────────┘      └──────┘
- * 
- * Luồng dữ liệu:
- *  - Read: Render → (nếu down) → Railway
- *  - Write: Render + Railway (dual-write)
- *  - Sync: Periodic schedule every 5 seconds
- * 
- * Các componet chính:
- *  - studentRepository: JPA repository cho Render DB
- *  - primaryJdbc: Direct JDBC cho Render
- *  - secondaryJdbc: Direct JDBC cho Railway
- *  - Health tracking: primaryDbHealthy, secondaryDbHealthy
- *  - Sync status: syncInProgress
- */
 @Service
 public class StudentService {
     private static final Logger log = LoggerFactory.getLogger(StudentService.class);
 
-    // 🏦 Repository - giao tiếp với Primary DB (Render)
     @Autowired
     private StudentRepository studentRepository;
 
-    // 📋 JDBC template cho Secondary DB (Railway)
     private final JdbcTemplate secondaryJdbc;
     
-    // ✅ JDBC template cho Primary DB (Render)
+    // ✅ Add primary JdbcTemplate for direct SQL queries
     private JdbcTemplate primaryJdbc;
     
-    // Inject primary datasource từ DataSourceConfig
     @Autowired
     public void setPrimaryDataSource(DataSource primaryDataSource) {
         this.primaryJdbc = new JdbcTemplate(primaryDataSource);
     }
     
-    // 🏥 Theo dõi sức khỏe của Render Database
-    // true = healthy (kết nối tốt), false = down (kết nối mất)
+    // ✅ Track health của Render DB
     private final AtomicBoolean primaryDbHealthy = new AtomicBoolean(true);
-    
-    // 🏥 Theo dõi sức khỏe của Railway Database
+    // ✅ NEW: Track secondary health separately
     private final AtomicBoolean secondaryDbHealthy = new AtomicBoolean(true);
     
-    // 🔄 Theo dõi trạng thái đồng bộ dữ liệu
-    // true = đang sync (chờ xong), false = idle (sẵn sàng)
+    // ✅ Track sync status
     private final AtomicBoolean syncInProgress = new AtomicBoolean(false);
 
-    // Cấu hình có bật secondary DB hay không
     @Value("${app.secondary.enabled:true}")
     private boolean secondaryEnabled;
     
-    // ⚙️ Retry configuration cho async writes
-    private static final int MAX_RETRIES = 3;               // Thử lại 3 lần
-    private static final int INITIAL_RETRY_DELAY_MS = 500;  // Chờ 500ms trước lần thử 1
+    // ✅ NEW: Retry configuration
+    private static final int MAX_RETRIES = 3;
+    private static final int INITIAL_RETRY_DELAY_MS = 500;
 
     public StudentService(@Qualifier("secondaryDataSource") DataSource secondaryDataSource) {
         this.secondaryJdbc = new JdbcTemplate(secondaryDataSource);
     }
 
     // ============================================
-    // ✅ KHỞI TẠO HỆ THỐNG (Initialization)
-    // ============================================
-
-    /**
-     * 🚀 @PostConstruct: Chạy sau khi cấu hình xong, trước khi app sử dụng
-     * Mục đích: Chuẩn bị Secondary DB (tạo table + sync dữ liệu)
-     */
-    @PostConstruct
-    public void initializeSecondaryDb() {
-        log.info("🔄 Initializing secondary database...");
-        initializeSecondaryDbAsync();  // Chạy async để không block startup
-    }
-
-    /**
-     * 🔄 @Async: Chạy trong background thread
-     * Mục đích: Tạo bảng students trong Railway nếu chưa có
-     * Sau đó tự động sync dữ liệu từ Render
-     */
-    @Async
-    private void initializeSecondaryDbAsync() {
-        // Step 1: Create table (bắt buộc trước sync)
-        try {
-            log.debug("📝 Creating/verifying secondary table...");
-            secondaryJdbc.execute("""
-                CREATE TABLE IF NOT EXISTS students (
-                    id BIGSERIAL PRIMARY KEY,
-                    name VARCHAR(255),
-                    email VARCHAR(255),
-                    phone VARCHAR(255),
-                    age INTEGER
-                )
-            """);
-            log.info("✅ Secondary table created/verified");
-            
-            // Verify table exists
-            Integer count = secondaryJdbc.queryForObject("SELECT COUNT(*) FROM students", Integer.class);
-            log.info("✅ Secondary table verified - current record count: {}", count);
-            secondaryDbHealthy.set(true);
-        } catch (Exception e) {
-            log.error("❌ Failed to create secondary table: {}", e.getMessage(), e);
-            secondaryDbHealthy.set(false);
-            return;  // ⚠️ Dừng nếu tạo table thất bại
-        }
-
-        // Step 2: Sync data từ Primary → Secondary (chỉ sau khi table ready)
-        syncToSecondaryAsync();
-    }
+    // ✅ FIX 1: Sequential Initialization (Race condition fix)
     // ============================================
 
     @PostConstruct
