@@ -20,44 +20,132 @@ import javax.sql.DataSource;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * 🧠 SERVICE: StudentService
+ * 
+ * Mục đích:
+ *  - Chứa logic nghiệp vụ (business logic) chính
+ *  - Xử lý CRUD operations cho sinh viên
+ *  - Quản lý dual-database (Render primary + Railway secondary)
+ *  - Tự động sync dữ liệu giữa 2 database
+ * 
+ * Kiến trúc Dual-Database:
+ *  ┌─────────────────────┐
+ *  │   Controller        │ (API Endpoints)
+ *  └──────────┬──────────┘
+ *             │
+ *  ┌──────────▼──────────┐
+ *  │  StudentService     │ (Logic + Failover)
+ *  └──┬────────────────┬─┘
+ *     │                │
+ *  ┌──▼────┐      ┌───▼──┐
+ *  │Render │      │Railway│ (Primary) (Secondary)
+ *  │(Render)      │(Rail) │
+ *  └─────────┘      └──────┘
+ * 
+ * Luồng dữ liệu:
+ *  - Read: Render → (nếu down) → Railway
+ *  - Write: Render + Railway (dual-write)
+ *  - Sync: Periodic schedule every 5 seconds
+ * 
+ * Các componet chính:
+ *  - studentRepository: JPA repository cho Render DB
+ *  - primaryJdbc: Direct JDBC cho Render
+ *  - secondaryJdbc: Direct JDBC cho Railway
+ *  - Health tracking: primaryDbHealthy, secondaryDbHealthy
+ *  - Sync status: syncInProgress
+ */
 @Service
 public class StudentService {
     private static final Logger log = LoggerFactory.getLogger(StudentService.class);
 
+    // 🏦 Repository - giao tiếp với Primary DB (Render)
     @Autowired
     private StudentRepository studentRepository;
 
+    // 📋 JDBC template cho Secondary DB (Railway)
     private final JdbcTemplate secondaryJdbc;
     
-    // ✅ Add primary JdbcTemplate for direct SQL queries
+    // ✅ JDBC template cho Primary DB (Render)
     private JdbcTemplate primaryJdbc;
     
+    // Inject primary datasource từ DataSourceConfig
     @Autowired
     public void setPrimaryDataSource(DataSource primaryDataSource) {
         this.primaryJdbc = new JdbcTemplate(primaryDataSource);
     }
     
-    // ✅ Track health của Render DB
+    // 🏥 Theo dõi sức khỏe của Render Database
+    // true = healthy (kết nối tốt), false = down (kết nối mất)
     private final AtomicBoolean primaryDbHealthy = new AtomicBoolean(true);
-    // ✅ NEW: Track secondary health separately
+    
+    // 🏥 Theo dõi sức khỏe của Railway Database
     private final AtomicBoolean secondaryDbHealthy = new AtomicBoolean(true);
     
-    // ✅ Track sync status
+    // 🔄 Theo dõi trạng thái đồng bộ dữ liệu
+    // true = đang sync (chờ xong), false = idle (sẵn sàng)
     private final AtomicBoolean syncInProgress = new AtomicBoolean(false);
 
+    // Cấu hình có bật secondary DB hay không
     @Value("${app.secondary.enabled:true}")
     private boolean secondaryEnabled;
     
-    // ✅ NEW: Retry configuration
-    private static final int MAX_RETRIES = 3;
-    private static final int INITIAL_RETRY_DELAY_MS = 500;
+    // ⚙️ Retry configuration cho async writes
+    private static final int MAX_RETRIES = 3;               // Thử lại 3 lần
+    private static final int INITIAL_RETRY_DELAY_MS = 500;  // Chờ 500ms trước lần thử 1
 
     public StudentService(@Qualifier("secondaryDataSource") DataSource secondaryDataSource) {
         this.secondaryJdbc = new JdbcTemplate(secondaryDataSource);
     }
 
     // ============================================
-    // ✅ FIX 1: Sequential Initialization (Race condition fix)
+    // ✅ KHỞI TẠO HỆ THỐNG (Initialization)
+    // ============================================
+
+    /**
+     * 🚀 @PostConstruct: Chạy sau khi cấu hình xong, trước khi app sử dụng
+     * Mục đích: Chuẩn bị Secondary DB (tạo table + sync dữ liệu)
+     */
+    @PostConstruct
+    public void initializeSecondaryDb() {
+        log.info("🔄 Initializing secondary database...");
+        initializeSecondaryDbAsync();  // Chạy async để không block startup
+    }
+
+    /**
+     * 🔄 @Async: Chạy trong background thread
+     * Mục đích: Tạo bảng students trong Railway nếu chưa có
+     * Sau đó tự động sync dữ liệu từ Render
+     */
+    @Async
+    private void initializeSecondaryDbAsync() {
+        // Step 1: Create table (bắt buộc trước sync)
+        try {
+            log.debug("📝 Creating/verifying secondary table...");
+            secondaryJdbc.execute("""
+                CREATE TABLE IF NOT EXISTS students (
+                    id BIGSERIAL PRIMARY KEY,
+                    name VARCHAR(255),
+                    email VARCHAR(255),
+                    phone VARCHAR(255),
+                    age INTEGER
+                )
+            """);
+            log.info("✅ Secondary table created/verified");
+            
+            // Verify table exists
+            Integer count = secondaryJdbc.queryForObject("SELECT COUNT(*) FROM students", Integer.class);
+            log.info("✅ Secondary table verified - current record count: {}", count);
+            secondaryDbHealthy.set(true);
+        } catch (Exception e) {
+            log.error("❌ Failed to create secondary table: {}", e.getMessage(), e);
+            secondaryDbHealthy.set(false);
+            return;  // ⚠️ Dừng nếu tạo table thất bại
+        }
+
+        // Step 2: Sync data từ Primary → Secondary (chỉ sau khi table ready)
+        syncToSecondaryAsync();
+    }
     // ============================================
 
     @PostConstruct
@@ -425,6 +513,19 @@ public class StudentService {
     // ✅ SYNC OPERATIONS
     // ============================================
 
+    public String resetSecondaryDb() {
+        try {
+            log.info("🚨 Clearing secondary database...");
+            secondaryJdbc.execute("TRUNCATE TABLE students CASCADE");
+            log.info("✅ Secondary DB cleared successfully");
+            syncToSecondaryAsync();
+            return "✅ Secondary DB reset and sync initiated";
+        } catch (Exception e) {
+            log.error("❌ Failed to reset secondary DB: {}", e.getMessage(), e);
+            return "❌ Reset failed: " + e.getMessage();
+        }
+    }
+
     @Async
     private void syncToSecondaryAsync() {
         if (!secondaryEnabled || syncInProgress.getAndSet(true)) {
@@ -445,22 +546,14 @@ public class StudentService {
             Integer secondaryCount = secondaryJdbc.queryForObject("SELECT COUNT(*) FROM students", Integer.class);
             log.info("📊 Secondary DB currently has {} records", secondaryCount);
 
-            // Sync missing records
+            // ✅ UPSERT pattern: handles duplicates gracefully
             for (Student student : allStudents) {
                 try {
-                    Integer exists = secondaryJdbc.queryForObject(
-                        "SELECT COUNT(*) FROM students WHERE id = ?",
-                        Integer.class,
-                        student.getId()
+                    secondaryJdbc.update(
+                        "INSERT INTO students (id, name, email, phone, age) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone, age = EXCLUDED.age",
+                        student.getId(), student.getName(), student.getEmail(),
+                        student.getPhone(), student.getAge()
                     );
-
-                    if (exists == 0) {
-                        secondaryJdbc.update(
-                            "INSERT INTO students (id, name, email, phone, age) VALUES (?, ?, ?, ?, ?)",
-                            student.getId(), student.getName(), student.getEmail(),
-                            student.getPhone(), student.getAge()
-                        );
-                    }
                 } catch (Exception e) {
                     log.warn("⚠️ Failed to sync student {}: {}", student.getId(), e.getMessage());
                 }
