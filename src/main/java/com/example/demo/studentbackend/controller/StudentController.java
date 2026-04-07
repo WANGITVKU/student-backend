@@ -23,6 +23,7 @@ import java.util.Map;
  *  - @RestController: Cho phép viết JSON response trực tiếp
  *  - @RequestMapping("/api/students"): Tiền tố URL cho tất cả endpoint
  *  - @GetMapping, @PostMapping, @PutMapping, @DeleteMapping: HTTP methods
+ *  - @CrossOrigin: Cho phép requests từ frontend ở domain khác (CORS)
  * 
  * Các Endpoint (REST API):
  *  GET    /api/students              → Lấy danh sách tất cả sinh viên
@@ -38,6 +39,7 @@ import java.util.Map;
  */
 @RestController
 @RequestMapping("/api/students")
+@CrossOrigin(origins = "*", methods = {RequestMethod.GET, RequestMethod.POST, RequestMethod.PUT, RequestMethod.DELETE, RequestMethod.OPTIONS})
 public class StudentController {
 
     // 🔗 Inject StudentService (chứa business logic)
