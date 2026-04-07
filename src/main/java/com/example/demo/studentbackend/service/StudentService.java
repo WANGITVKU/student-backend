@@ -70,6 +70,7 @@ public class StudentService {
     private void initializeSecondaryDbAsync() {
         // Step 1: Create table (required before sync)
         try {
+            log.debug("📝 Creating/verifying secondary table...");
             secondaryJdbc.execute("""
                 CREATE TABLE IF NOT EXISTS students (
                     id BIGSERIAL PRIMARY KEY,
@@ -80,9 +81,13 @@ public class StudentService {
                 )
             """);
             log.info("✅ Secondary table created/verified");
+            
+            // Verify table exists
+            Integer count = secondaryJdbc.queryForObject("SELECT COUNT(*) FROM students", Integer.class);
+            log.info("✅ Secondary table verified - current record count: {}", count);
             secondaryDbHealthy.set(true);
         } catch (Exception e) {
-            log.error("❌ Failed to create secondary table: {}", e.getMessage());
+            log.error("❌ Failed to create secondary table: {}", e.getMessage(), e);
             secondaryDbHealthy.set(false);
             return;  // ⚠️ Stop sync if table creation failed
         }
@@ -141,10 +146,15 @@ public class StudentService {
     public List<Student> getAllStudents() {
         if (primaryDbHealthy.get()) {
             try {
+                log.debug("📖 Reading from primary DB...");
                 List<Student> result = studentRepository.findAll();
-                log.info("✅ Read from primary DB: {} records", result.size());
+                log.info("✅ Read from primary DB: {} records found", result.size());
+                for (Student s : result) {
+                    log.debug("   - ID: {}, Name: {}, Email: {}", s.getId(), s.getName(), s.getEmail());
+                }
                 return result;
             } catch (Exception e) {
+                log.error("❌ ERROR reading from primary DB: {}", e.getMessage(), e);
                 log.warn("⚠️ Primary DB read failed, falling back to secondary");
                 primaryDbHealthy.set(false);
                 return fallbackToSecondary("SELECT * FROM students ORDER BY id");
@@ -224,8 +234,21 @@ public class StudentService {
         if (primaryDbHealthy.get()) {
             try {
                 // ✅ Primary write (main path)
+                log.debug("📝 Saving student: name={}, email={}", student.getName(), student.getEmail());
                 Student saved = studentRepository.save(student);
-                log.info("✅ Student {} created in primary DB", saved.getId());
+                log.info("✅ Student {} INSERTED into primary DB: {}", saved.getId(), saved.getName());
+                
+                // ✅ Verify data was actually saved by reading back
+                try {
+                    Student verify = studentRepository.findById(saved.getId()).orElse(null);
+                    if (verify != null) {
+                        log.info("✅ VERIFIED: Student {} exists in primary DB after save", verify.getId());
+                    } else {
+                        log.error("❌ WARNING: Student {} not found after save! Data commit might have failed", saved.getId());
+                    }
+                } catch (Exception verifyEx) {
+                    log.error("❌ Failed to verify saved student: {}", verifyEx.getMessage());
+                }
 
                 // ✅ Async secondary write (with retry)
                 writeToSecondaryAsync(
@@ -236,6 +259,7 @@ public class StudentService {
                 return saved;
 
             } catch (Exception e) {
+                log.error("❌ PRIMARY DB WRITE FAILED - Exception: {}", e.getMessage(), e);
                 log.warn("❌ Primary DB write failed, attempting secondary failover: {}", e.getMessage());
                 primaryDbHealthy.set(false);
                 
